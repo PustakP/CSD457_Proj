@@ -222,6 +222,5 @@ This project is for educational and research purposes. Check individual library 
 
 ---
 
-**Author**: IoT Quantum-Safe Crypto Research  
+**Author**: Pustak Pathak
 **Date**: 2025  
-**Status**: Demonstration/Educational
