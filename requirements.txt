@@ -1,0 +1,4 @@
+# quantum-safe crypto for iot project
+kyber-py>=0.3.0
+pycryptodome>=3.19.0
+
