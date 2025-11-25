@@ -268,34 +268,62 @@ On your **laptop**:
 
 ## Wiring Guide
 
-### Button Demo Wiring (Minimal)
+### 4-Pin Tactile Button Wiring
+
+The common 4-pin tactile button (6mm x 6mm momentary switch) has this internal structure:
 
 ```
-    ARDUINO UNO
-   ┌────────────┐
-   │            │
-   │  D2  ●─────┼────[BUTTON]────┐
-   │            │                │
-   │  GND ●─────┼────────────────┘
-   │            │
-   │ USB-B ●────┼────────────────→ Raspberry Pi USB-A
+  4-PIN TACTILE BUTTON (top view)
+  ┌─────────────────┐
+  │  1 ●───────● 2  │   Pins 1-2 are connected internally
+  │       ┃         │   Pins 3-4 are connected internally
+  │      ═╋═        │   Press button → connects 1-2 to 3-4
+  │       ┃         │
+  │  3 ●───────● 4  │   
+  └─────────────────┘
+  
+  When pressed: all 4 pins connected
+  When released: 1-2 separate from 3-4
+```
+
+**You only need 2 wires** - connect any pin from top row to Arduino, any pin from bottom row to GND:
+
+```
+    ARDUINO UNO                         4-PIN TACTILE BUTTON
+   ┌────────────┐                       ┌───────────────┐
+   │            │                       │  1 ●     ● 2  │
+   │  D2  ●─────┼───────────────────────┼──┘            │
+   │            │                       │               │
+   │  GND ●─────┼───────────────────────┼──────────● 4  │
+   │            │                       │  3 ●          │
+   │ USB-B ●────┼───→ Raspberry Pi      └───────────────┘
    │            │
    └────────────┘
 
-NOTES:
-- Button is a simple momentary push button
-- Uses Arduino's internal pullup resistor (no external resistor needed)
-- Can also just touch a wire between D2 and GND to trigger
-
-ALTERNATIVE (No Button):
-- Just use a jumper wire
-- Touch one end to Pin 2, other to GND
-- Release to complete trigger
+WIRING SUMMARY:
+  • Arduino Pin 2  →  Button Pin 1 (or 2)
+  • Arduino GND    →  Button Pin 3 (or 4)
+  
+  That's it! No resistors needed (Arduino uses internal pullup)
 ```
+
+### How It Works
+
+- **Not pressed**: Pin 2 reads HIGH (internal pullup)
+- **Pressed**: Pin 2 connects to GND through button → reads LOW
+- **Release**: Springs back, Pin 2 returns to HIGH
+- **Debounce**: Code waits 300ms to ignore switch bounce
 
 ### LED Indicator
 
-The Arduino's built-in LED (Pin 13) blinks when data is sent.
+The Arduino's built-in LED (Pin 13) blinks when data is sent - confirms button press registered.
+
+### No Button? Use a Wire!
+
+```
+Just touch a jumper wire between Pin 2 and GND briefly.
+Same effect as pressing the button.
+```
 
 ---
 

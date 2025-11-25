@@ -31,10 +31,19 @@ cd ~/iot_kyber && source venv/bin/activate && python live_demo.py
 ## 🔌 WIRING (2 WIRES!)
 
 ```
-Arduino Pin 2 ----[BUTTON]---- GND
-Arduino USB-B ----[CABLE]----- RPi USB-A
+4-PIN TACTILE BUTTON:
+  ┌─────────┐
+  │ 1 ● ● 2 │  ← Connect Pin 1 (or 2) to Arduino D2
+  │         │
+  │ 3 ● ● 4 │  ← Connect Pin 3 (or 4) to Arduino GND
+  └─────────┘
+
+Arduino Pin 2  ───→  Button top pin (1 or 2)
+Arduino GND    ───→  Button bottom pin (3 or 4)
+Arduino USB-B  ───→  RPi USB-A
 ```
 
+**No resistors needed!** Arduino uses internal pullup.
 **No button?** Just touch wire from Pin 2 to GND to trigger.
 
 ---

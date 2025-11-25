@@ -2,7 +2,16 @@
  * button_demo.ino - button-triggered sensor simulation for demo
  * arduino uno connected to rpi via usb serial
  * 
- * wiring: button between pin 2 and gnd (uses internal pullup)
+ * for 4-pin tactile button (6x6mm momentary switch):
+ *   - top pins (1,2) connected internally
+ *   - bottom pins (3,4) connected internally
+ *   - pressing connects top to bottom
+ * 
+ * wiring:
+ *   - arduino pin 2 → button pin 1 or 2 (top row)
+ *   - arduino gnd   → button pin 3 or 4 (bottom row)
+ *   - no resistor needed (uses internal pullup)
+ * 
  * press button -> triggers simulated sensor data -> rpi does pre + kyber
  */
 
@@ -152,16 +161,25 @@ void handleIncoming() {
 }
 
 /*
- * WIRING FOR DEMO:
+ * WIRING FOR 4-PIN TACTILE BUTTON:
  * 
- * Arduino UNO:
- *   - Pin 2 ----[BUTTON]---- GND
- *   - USB-B connected to Raspberry Pi USB port
+ *   4-pin button (top view):
+ *     ┌─────────┐
+ *     │ 1 ● ● 2 │  ← pins 1-2 connected internally
+ *     │         │
+ *     │ 3 ● ● 4 │  ← pins 3-4 connected internally
+ *     └─────────┘
  * 
- * That's it! No other components needed.
+ *   Arduino UNO:
+ *     - Pin 2 → button pin 1 or 2 (either works)
+ *     - GND   → button pin 3 or 4 (either works)
+ *     - USB-B → raspberry pi usb port
  * 
- * Button uses internal pullup, so:
- *   - Button open = HIGH (not pressed)
- *   - Button pressed = LOW (gnd connected)
+ *   No resistors needed! uses internal pullup.
+ * 
+ *   How it works:
+ *     - not pressed: pin 2 = HIGH (pullup)
+ *     - pressed: pin 2 = LOW (connected to gnd thru button)
+ *     - 300ms debounce ignores switch bounce
  */
 
