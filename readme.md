@@ -37,7 +37,16 @@ iotproj/
 ├── proxy_reencryption.py         # fog computing proxy re-enc
 ├── performance_analysis.py       # benchmarking & analysis tools
 ├── main_demo.py                  # interactive demo
-└── readme.md                     # this file
+├── readme.md                     # this file
+└── hardware/                     # hardware demo files
+    ├── SETUP_GUIDE.md            # complete setup instructions
+    ├── QUICK_REFERENCE.md        # demo day cheat sheet
+    ├── arduino/
+    │   └── button_demo/          # button-triggered demo sketch
+    └── raspberry_pi/
+        ├── live_demo.py          # ★ ssh live updating demo
+        ├── fog_gateway.py        # fog gateway implementation
+        └── cloud_server.py       # cloud server simulation
 ```
 
 ## Installation
@@ -63,6 +72,24 @@ Run the interactive demo:
 ```bash
 python main_demo.py
 ```
+
+### Hardware Demo (Arduino + Raspberry Pi)
+
+For a physical demonstration with button-triggered proxy re-encryption:
+
+```bash
+# ssh into raspberry pi
+ssh pi@raspberrypi.local
+
+# run the live demo
+cd ~/iot_kyber && source venv/bin/activate
+python live_demo.py
+
+# press button on arduino → watch pqc encryption happen live!
+```
+
+See `hardware/SETUP_GUIDE.md` for full hardware setup instructions.
+See `hardware/QUICK_REFERENCE.md` for demo day cheat sheet.
 
 ### Individual Demos
 

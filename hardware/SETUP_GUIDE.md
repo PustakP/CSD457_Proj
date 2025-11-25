@@ -7,15 +7,50 @@ This guide walks you through setting up a complete hardware demo of post-quantum
 
 ## Table of Contents
 
-1. [Hardware Overview](#hardware-overview)
-2. [Architecture Diagram](#architecture-diagram)
-3. [Raspberry Pi Setup](#raspberry-pi-setup)
-4. [Arduino UNO Setup](#arduino-uno-setup)
-5. [Wiring Guide](#wiring-guide)
-6. [Software Installation](#software-installation)
+1. [Quick Start (Demo Day)](#quick-start-demo-day)
+2. [Hardware Overview](#hardware-overview)
+3. [Architecture Diagram](#architecture-diagram)
+4. [Raspberry Pi Setup](#raspberry-pi-setup)
+5. [Arduino UNO Setup](#arduino-uno-setup)
+6. [Wiring Guide](#wiring-guide)
 7. [Running the Demo](#running-the-demo)
 8. [Troubleshooting](#troubleshooting)
 9. [Understanding the Results](#understanding-the-results)
+
+---
+
+## Quick Start (Demo Day)
+
+**For the button-triggered demo via SSH:**
+
+### On Your Laptop (SSH into RPi):
+
+```bash
+# ssh into raspberry pi
+ssh pi@<raspberry_pi_ip>
+
+# go to project dir and activate venv
+cd ~/iot_kyber
+source venv/bin/activate
+
+# run the live demo script
+python live_demo.py
+```
+
+### What Happens:
+1. Press **button on Arduino** → LED blinks
+2. Arduino sends XOR-encrypted "sensor" data over USB serial
+3. Raspberry Pi receives and decrypts
+4. **Proxy Re-Encryption** transforms data using CRYSTALS-Kyber
+5. Simulated cloud decrypts and displays results
+6. All steps shown **live in SSH terminal** with timing metrics
+
+### Hardware Needed:
+- Arduino UNO + push button (between pin 2 and GND)
+- Raspberry Pi 4 (SSH access configured)
+- USB cable connecting Arduino to RPi
+
+That's it! No sensors, no monitor needed.
 
 ---
 
@@ -28,15 +63,16 @@ This guide walks you through setting up a complete hardware demo of post-quantum
 | **Arduino UNO** | ATmega328P, 2KB SRAM, 32KB Flash | IoT Sensor Node (constrained device) |
 | **Raspberry Pi 4** | 8GB RAM, ARM Cortex-A72 | Fog Gateway + Cloud Server |
 | **32GB SD Card** | Class 10+ recommended | RPi OS storage |
-| **Micro HDMI to HDMI** | For initial setup | RPi display connection |
-| **Your Laptop** | Any OS | Development & monitoring |
+| **Push Button** | Momentary switch | Demo trigger |
+| **Your Laptop** | Any OS | SSH terminal for demo |
 
-### Additional Items Needed
+### Minimal Demo Setup
 
-- USB-A to USB-B cable (Arduino programming cable)
-- Power supply for Raspberry Pi 4 (USB-C, 5V 3A)
-- Keyboard & mouse for initial RPi setup (or SSH)
-- Optional: Breadboard, LEDs, sensors for real data
+For the button-triggered demo, you only need:
+- Arduino UNO
+- One push button (or just wire between pin 2 and GND to trigger)
+- USB cable to Raspberry Pi
+- SSH access to Raspberry Pi
 
 ---
 
@@ -44,7 +80,8 @@ This guide walks you through setting up a complete hardware demo of post-quantum
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                        QUANTUM-SAFE IOT ARCHITECTURE                     │
+│                     QUANTUM-SAFE IOT DEMO ARCHITECTURE                   │
+│                         (Button-Triggered Demo)                          │
 └──────────────────────────────────────────────────────────────────────────┘
 
     ┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
@@ -53,31 +90,35 @@ This guide walks you through setting up a complete hardware demo of post-quantum
     └────────┬────────┘         └────────┬────────┘         └────────┬────────┘
              │                           │                           │
              │  ┌─────────────────┐      │  ┌─────────────────┐      │
-             │  │ Sensor Reading  │      │  │ Kyber-512 KEM   │      │
-             │  │ + XOR Encrypt   │      │  │ Encapsulation   │      │
-             │  │ (lightweight)   │      │  │ + AES-GCM       │      │
+             │  │ Button Press    │      │  │ Kyber-512 KEM   │      │
+             │  │ → Simulated     │      │  │ Encapsulation   │      │
+             │  │   Sensor Data   │      │  │ + Proxy RE      │      │
+             │  │ → XOR Encrypt   │      │  │ + AES-GCM       │      │
              │  └─────────────────┘      │  └─────────────────┘      │
              │                           │                           │
              ▼                           ▼                           ▼
     ┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
-    │  XOR-encrypted  │────────▶│ Decrypt XOR     │────────▶│ Kyber-512 KEM   │
-    │  sensor data    │         │ Re-encrypt with │         │ Decapsulation   │
-    │  over Serial    │         │ Kyber for Cloud │         │ + AES-GCM Dec   │
+    │  ENC:4B594...   │────────▶│ 1. Decrypt XOR  │────────▶│ Kyber-512 KEM   │
+    │  (hex over USB) │         │ 2. Kyber encaps │         │ Decapsulation   │
+    │                 │         │ 3. Proxy RE     │         │ + AES-GCM Dec   │
     └─────────────────┘         └─────────────────┘         └─────────────────┘
                                                                      │
                                                                      ▼
                                                             ┌─────────────────┐
-                                                            │ Store & Analyze │
-                                                            │ Sensor Data     │
+                                                            │ Display Data in │
+                                                            │ SSH Terminal    │
                                                             └─────────────────┘
 
-DATA FLOW:
-1. Arduino reads sensors (or simulates data)
-2. Arduino XOR-encrypts with pre-shared key
-3. Sends hex-encoded data over USB serial
-4. RPi Gateway receives, decrypts XOR
-5. Gateway encrypts with Kyber+AES for cloud
-6. Cloud decrypts and stores data
+DEMO WORKFLOW:
+1. Press button on Arduino
+2. Arduino generates simulated temp/humidity/light data
+3. Arduino XOR-encrypts with pre-shared key (lightweight for constrained device)
+4. Sends hex-encoded data over USB serial to RPi
+5. RPi Gateway receives, decrypts XOR layer
+6. Gateway performs CRYSTALS-Kyber encapsulation (device key)
+7. Gateway does Proxy Re-Encryption (transforms to cloud key)
+8. Cloud decapsulates and decrypts
+9. All displayed live in SSH terminal with timing
 ```
 
 ---
@@ -90,43 +131,37 @@ DATA FLOW:
 2. Insert 32GB SD card into your laptop
 3. Open Raspberry Pi Imager
 4. Select:
-   - **OS**: Raspberry Pi OS (64-bit) - Full version recommended
+   - **OS**: Raspberry Pi OS (64-bit) - Lite version OK for headless
    - **Storage**: Your 32GB SD card
 5. Click the ⚙️ gear icon for advanced options:
-   - ✅ Enable SSH
+   - ✅ **Enable SSH** (important!)
    - Set username: `pi` (or your choice)
    - Set password (remember this!)
-   - Configure WiFi if needed
+   - Configure WiFi (network name and password)
    - Set locale/timezone
 6. Click **WRITE** and wait for completion
 
-### Step 2: First Boot
+### Step 2: First Boot (Headless)
 
 1. Insert SD card into Raspberry Pi 4
 2. Connect:
-   - Micro HDMI → HDMI monitor
-   - USB keyboard & mouse
-   - Ethernet cable (if not using WiFi)
+   - Ethernet cable OR WiFi will auto-connect
    - USB-C power supply
-3. Power on - wait for desktop to appear (2-3 minutes first boot)
+3. Wait 2-3 minutes for first boot
+4. Find RPi IP address:
+   ```bash
+   # from your laptop (same network)
+   ping raspberrypi.local
+   # or check your router's DHCP leases
+   ```
+5. SSH in:
+   ```bash
+   ssh pi@<raspberry_pi_ip>
+   # or
+   ssh pi@raspberrypi.local
+   ```
 
-### Step 3: Enable Serial (for Arduino communication)
-
-Open Terminal and run:
-
-```bash
-# enable hardware serial
-sudo raspi-config
-```
-
-Navigate to:
-- **Interface Options** → **Serial Port**
-- Would you like a login shell accessible over serial? → **No**
-- Would you like the serial port hardware enabled? → **Yes**
-
-Reboot when prompted.
-
-### Step 4: Install Software
+### Step 3: Install Software
 
 ```bash
 # update system
@@ -153,27 +188,34 @@ pip install kyber-py pycryptodome pyserial
 mkdir -p ~/iot_kyber_data
 ```
 
-### Step 5: Copy Project Files
+### Step 4: Copy Project Files
 
-**Option A: From USB Drive**
+**Option A: Using SCP from Laptop (recommended)**
 ```bash
-# mount usb
+# from your laptop terminal (in project directory)
+scp -r hardware/raspberry_pi/* pi@<raspberry_pi_ip>:~/iot_kyber/
+scp *.py pi@<raspberry_pi_ip>:~/iot_kyber/
+```
+
+**Option B: From USB Drive**
+```bash
+# on raspberry pi
 sudo mount /dev/sda1 /mnt
 cp -r /mnt/hardware/raspberry_pi/* ~/iot_kyber/
 cp /mnt/*.py ~/iot_kyber/
 sudo umount /mnt
 ```
 
-**Option B: Using SCP from Laptop**
-```bash
-# from your laptop terminal
-scp -r hardware/raspberry_pi/* pi@<raspberry_pi_ip>:~/iot_kyber/
-scp *.py pi@<raspberry_pi_ip>:~/iot_kyber/
-```
+### Step 5: Verify Installation
 
-**Option C: Git Clone (if repo is hosted)**
 ```bash
-git clone <your-repo-url> ~/iot_kyber
+cd ~/iot_kyber
+source venv/bin/activate
+
+# test imports
+python -c "from kyber_py.kyber import Kyber512; print('✓ Kyber OK')"
+python -c "from Crypto.Cipher import AES; print('✓ AES OK')"
+python -c "import serial; print('✓ Serial OK')"
 ```
 
 ---
@@ -193,199 +235,122 @@ On your **laptop**:
    - **Tools** → **Board** → **Arduino UNO**
    - **Tools** → **Port** → Select the COM port (Windows) or `/dev/ttyACM0` (Linux/Mac)
 
-### Step 3: Upload Sketch
+### Step 3: Upload Button Demo Sketch
 
-1. Open `hardware/arduino/iot_sensor/iot_sensor.ino`
+1. Open `hardware/arduino/button_demo/button_demo.ino`
 2. Click **Upload** (→ arrow button)
 3. Wait for "Done uploading" message
 
 ### Step 4: Test Arduino
 
-Open Serial Monitor (Tools → Serial Monitor):
-- Set baud rate to **9600**
-- You should see:
-  ```
-  # INIT: ARDUINO_IOT_001 online
-  ENC:4B594245525F494F...  (hex encoded data every 5 seconds)
-  ```
+1. Open Serial Monitor (Tools → Serial Monitor)
+2. Set baud rate to **9600**
+3. You should see:
+   ```
+   # INIT: ARDUINO_SENSOR_001 ready
+   # MODE: button-triggered demo
+   # WAITING: press button to send sensor data
+   ```
+4. Connect a wire from Pin 2 to GND briefly (or press button)
+5. You should see:
+   ```
+   # BUTTON: pressed
+   ENC:4B594245525F...
+   ```
 
 ### Step 5: Move Arduino to Raspberry Pi
 
 1. Disconnect Arduino from laptop
 2. Connect Arduino to Raspberry Pi via USB
-3. Arduino will auto-start sending data
+3. Arduino will auto-start sending data when button pressed
 
 ---
 
 ## Wiring Guide
 
-### Basic Demo (No External Sensors)
-
-For the basic demo, you only need:
-- Arduino UNO connected to Raspberry Pi via USB
-
-The Arduino will generate **simulated sensor data** automatically.
-
-### With Real Sensors (Optional)
-
-#### Temperature Sensor (TMP36)
+### Button Demo Wiring (Minimal)
 
 ```
-TMP36 Pinout:
-  ┌─────┐
-  │     │
-  │  T  │
-  │  M  │
-  │  P  │
-  │  3  │
-  │  6  │
-  └─┬─┬─┬─┘
-    │ │ │
-   VCC OUT GND
-
-Wiring:
-  TMP36 VCC  → Arduino 5V
-  TMP36 OUT  → Arduino A0
-  TMP36 GND  → Arduino GND
-```
-
-#### Light Sensor (Photoresistor/LDR)
-
-```
-         Arduino 5V
-              │
-              │
-            ┌───┐
-            │LDR│
-            └─┬─┘
-              │
-              ├────── Arduino A2
-              │
-            [10kΩ]
-              │
-              │
-          Arduino GND
-```
-
-#### Complete Wiring Diagram
-
-```
-    ARDUINO UNO                      OPTIONAL SENSORS
+    ARDUINO UNO
    ┌────────────┐
-   │            │                    TMP36 (Temp)
-   │  5V ●──────┼───────────────────→ VCC
-   │            │                       │
-   │  A0 ●──────┼───────────────────→ OUT
    │            │
-   │  A2 ●──────┼──────┬────────────── LDR
-   │            │      │
-   │            │    [10kΩ]
-   │            │      │
-   │ GND ●──────┼──────┴──── GND ←──── GND (all sensors)
+   │  D2  ●─────┼────[BUTTON]────┐
+   │            │                │
+   │  GND ●─────┼────────────────┘
    │            │
-   │  D2 ●──────┼─────────[Button]──── GND (optional trigger)
-   │            │
-   │ USB-B ●────┼─────────────────────→ Raspberry Pi USB-A
+   │ USB-B ●────┼────────────────→ Raspberry Pi USB-A
    │            │
    └────────────┘
+
+NOTES:
+- Button is a simple momentary push button
+- Uses Arduino's internal pullup resistor (no external resistor needed)
+- Can also just touch a wire between D2 and GND to trigger
+
+ALTERNATIVE (No Button):
+- Just use a jumper wire
+- Touch one end to Pin 2, other to GND
+- Release to complete trigger
 ```
 
----
+### LED Indicator
 
-## Software Installation
-
-### Raspberry Pi
-
-```bash
-# activate virtual environment
-cd ~/iot_kyber
-source venv/bin/activate
-
-# verify installation
-python -c "from kyber_py.kyber import Kyber512; print('Kyber OK')"
-python -c "from Crypto.Cipher import AES; print('AES OK')"
-python -c "import serial; print('Serial OK')"
-```
-
-### Find Arduino Serial Port
-
-```bash
-# list serial ports
-ls /dev/tty*
-
-# usually one of:
-# /dev/ttyACM0  (most common for Arduino UNO)
-# /dev/ttyUSB0  (if using USB-serial adapter)
-
-# test connection
-screen /dev/ttyACM0 9600
-# you should see ENC:... messages
-# press Ctrl+A then K to exit screen
-```
-
-### Update Config (if needed)
-
-Edit `config.py` if your serial port is different:
-
-```python
-SERIAL_PORT = '/dev/ttyACM0'  # change if needed
-```
+The Arduino's built-in LED (Pin 13) blinks when data is sent.
 
 ---
 
 ## Running the Demo
 
-### Method 1: Interactive Demo (Recommended)
+### Primary Method: Live SSH Demo
 
 ```bash
+# ssh into raspberry pi
+ssh pi@raspberrypi.local  # or pi@<ip_address>
+
+# navigate and activate
 cd ~/iot_kyber
 source venv/bin/activate
 
-# run interactive demo
+# run live demo
+python live_demo.py
+```
+
+**During Demo:**
+1. Terminal shows live updating display
+2. Press button on Arduino
+3. Watch the workflow steps execute:
+   - Device Encryption (Kyber KEM + AES)
+   - Gateway Proxy Re-Encryption
+   - Cloud Decryption
+4. See timing metrics and decrypted sensor data
+5. Press Ctrl+C to exit
+
+### Alternative: Simulation Mode (No Arduino)
+
+```bash
+# runs with auto-simulated data (every 30 seconds)
+python live_demo.py
+# will show "arduino not found - using simulation mode"
+```
+
+### Alternative: Original Demo Runner
+
+```bash
+# interactive menu with all scenarios
 python run_demo.py
-```
 
-This shows a menu:
-```
-  1. Full Kyber encryption
-  2. Hybrid Kyber-AES
-  3. Proxy re-encryption
-  4. Hardware demo (Arduino → RPi → Cloud)
-  5. Performance comparison
-  6. Run all demos
-```
-
-### Method 2: Simulation Mode (No Arduino)
-
-```bash
-# if arduino not connected, use simulation
+# with arduino simulation
 python run_demo.py --simulate
-```
 
-### Method 3: Individual Components
-
-```bash
-# run just the fog gateway
-python fog_gateway.py
-
-# or with simulation
-python fog_gateway.py --simulate
-
-# run cloud server standalone
-python cloud_server.py
-```
-
-### Method 4: Full Automated Demo
-
-```bash
-python run_demo.py --full --simulate
+# full automated demo
+python run_demo.py --full
 ```
 
 ---
 
 ## Troubleshooting
 
-### Arduino Not Detected
+### Arduino Not Detected on RPi
 
 ```bash
 # check if arduino is visible
@@ -393,17 +358,16 @@ ls /dev/ttyACM*
 ls /dev/ttyUSB*
 
 # if not found:
-# 1. try different usb port
-# 2. check usb cable (some are charge-only)
-# 3. replug arduino
+# 1. unplug and replug arduino
+# 2. try different usb port on rpi
+# 3. check usb cable (some are charge-only)
 
 # check permissions
-groups $USER
-# should show 'dialout'
+groups $USER  # should show 'dialout'
 
 # if not in dialout group:
 sudo usermod -a -G dialout $USER
-# then logout and login again
+# then logout and login (or reboot)
 ```
 
 ### Serial Permission Denied
@@ -417,6 +381,21 @@ sudo usermod -a -G dialout $USER
 # logout and login
 ```
 
+### SSH Connection Issues
+
+```bash
+# make sure ssh is enabled on rpi
+# if you can access rpi directly:
+sudo raspi-config
+# Interface Options → SSH → Enable
+
+# check rpi is on network
+ping raspberrypi.local
+
+# check ssh service
+sudo systemctl status ssh
+```
+
 ### Python Import Errors
 
 ```bash
@@ -427,17 +406,14 @@ source ~/iot_kyber/venv/bin/activate
 pip install --force-reinstall kyber-py pycryptodome pyserial
 ```
 
-### Kyber Import Error
+### Display Issues in SSH
 
 ```bash
-# kyber-py requires python 3.8+
-python --version
+# if colors don't show, terminal might not support ANSI
+export TERM=xterm-256color
 
-# if using older python:
-sudo apt install python3.10
-python3.10 -m venv venv
-source venv/bin/activate
-pip install kyber-py pycryptodome pyserial
+# resize terminal if display is cut off
+# (make terminal window taller - at least 50 lines)
 ```
 
 ---
@@ -448,86 +424,53 @@ pip install kyber-py pycryptodome pyserial
 
 | Metric | What It Measures | Typical Value (RPi4) |
 |--------|------------------|----------------------|
-| **keygen_time_ms** | Time to generate Kyber keypair | 5-20ms |
-| **encrypt_time_ms** | Time for Kyber encaps + AES encrypt | 2-8ms |
-| **decrypt_time_ms** | Time for Kyber decaps + AES decrypt | 2-10ms |
-| **memory_kb** | Peak RAM during operation | 50-200KB |
-| **ciphertext_size** | Total encrypted payload size | ~800-900 bytes |
+| **Device Encrypt** | Kyber encaps + AES encrypt | 3-8 ms |
+| **Gateway PRE** | Proxy re-encryption transform | 5-12 ms |
+| **Cloud Decrypt** | Kyber decaps + AES decrypt | 5-15 ms |
+| **Total Workflow** | End-to-end time | 15-35 ms |
+| **Kyber CT Size** | Ciphertext size | ~768 bytes (Kyber-512) |
 
-### Interpreting Device Suitability
+### Security Levels
 
-```
-Device Class      RAM      Suitability for Kyber
-─────────────────────────────────────────────────
-Class 0 (sensor)  10KB     ❌ Too constrained - use PRE
-Class 1 (ESP8266) 80KB     ⚠️ Borderline - use Hybrid
-Class 2 (ESP32)   512KB    ✅ Hybrid Kyber-512 works
-Fog Gateway       2MB+     ✅ Full Kyber-768
-Cloud             8GB+     ✅ Kyber-1024
-```
+| Level | Security | Key Size | CT Size | Use Case |
+|-------|----------|----------|---------|----------|
+| Kyber-512 | NIST Level 1 | 800 B | 768 B | IoT, constrained |
+| Kyber-768 | NIST Level 3 | 1184 B | 1088 B | General purpose |
+| Kyber-1024 | NIST Level 5 | 1568 B | 1568 B | High security |
 
-### Expected Demo Output
+### What the Demo Proves
 
-```
-[gateway] received encrypted data (85 bytes)
-[gateway] device: ARDUINO_IOT_001, temp: 24.5°C, humidity: 58%, light: 520
-[gateway] re-encrypted for cloud (kyber_ct: 768B, aes_ct: 93B)
-[gateway] enc time: 6.42ms
-[cloud] ✓ decrypted sensor data:
-  device: ARDUINO_IOT_001
-  temp: 24.5°C
-  humidity: 58%
-  light: 520 lux
-  decryption: 7.15ms
-```
+1. **Post-Quantum Security**: CRYSTALS-Kyber protects against quantum attacks
+2. **Fog Computing**: Gateway handles heavy crypto for constrained devices
+3. **Proxy Re-Encryption**: Data transformed without gateway seeing plaintext
+4. **Real-Time Performance**: Encryption/decryption in milliseconds
 
 ---
 
-## Demo Scenarios
+## Demo Script for Presentation
 
-### Scenario 1: Present to Audience
+### Opening (30 seconds)
+"This demo shows how we can protect IoT sensor data using post-quantum cryptography. The Arduino represents a constrained IoT sensor, and the Raspberry Pi acts as a fog computing gateway."
 
-1. Show architecture diagram (draw on whiteboard)
-2. Start with `python run_demo.py`
-3. Run scenarios 1, 2, 3 to explain each approach
-4. Run performance comparison (scenario 5)
-5. Run hardware demo (scenario 4) - shows real data flow
+### Button Press Demo (2 minutes)
+1. Show the SSH terminal with live_demo.py running
+2. Press button: "When the sensor detects data..."
+3. Point out each step as it lights up
+4. Show the timing metrics
+5. Show the decrypted sensor values
 
-### Scenario 2: Compare Security Levels
+### Key Points to Mention
+- "CRYSTALS-Kyber is a NIST-standardized post-quantum algorithm"
+- "Proxy re-encryption lets the gateway transform the encryption without seeing the data"
+- "Total processing time is only X milliseconds"
+- "This approach offloads heavy crypto from constrained devices"
 
-```bash
-# edit config.py
-KYBER_SECURITY_LEVEL = 768  # or 1024
-
-# run demo again to see timing differences
-```
-
-### Scenario 3: Stress Test
-
-```bash
-# modify Arduino sketch
-#define SENSOR_INTERVAL_MS 1000  // 1 second
-
-# re-upload and run demo
-# observe throughput and latency
-```
+### Closing (30 seconds)
+"This architecture is practical for real IoT deployments where quantum computers may become a threat in the device's lifetime."
 
 ---
 
-## Security Notes
-
-⚠️ **This is a demonstration project.** For production:
-
-1. Replace XOR encryption with proper lightweight crypto (AES-CCM)
-2. Implement secure key provisioning
-3. Add device authentication
-4. Use hardware security modules where available
-5. Implement proper certificate management
-6. Add replay attack protection (timestamps, nonces)
-
----
-
-## File Structure After Setup
+## File Structure
 
 ```
 ~/iot_kyber/
@@ -536,12 +479,11 @@ KYBER_SECURITY_LEVEL = 768  # or 1024
 ├── fog_gateway.py           # raspberry pi gateway
 ├── cloud_server.py          # cloud server simulation
 ├── run_demo.py              # interactive demo runner
+├── live_demo.py             # ★ SSH live updating demo
 ├── full_kyber.py            # pure kyber implementation
 ├── hybrid_kyber_aes.py      # hybrid approach
 ├── proxy_reencryption.py    # pre implementation
 └── ~/iot_kyber_data/        # stored metrics and data
-    ├── metrics.json
-    └── cloud_data.json
 ```
 
 ---
@@ -549,23 +491,26 @@ KYBER_SECURITY_LEVEL = 768  # or 1024
 ## Quick Reference Commands
 
 ```bash
+# ssh into raspberry pi
+ssh pi@raspberrypi.local
+
 # activate environment
-source ~/iot_kyber/venv/bin/activate
+cd ~/iot_kyber && source venv/bin/activate
 
-# run demo
-python run_demo.py
+# run live demo (main script for demo)
+python live_demo.py
 
-# simulation mode
-python run_demo.py --simulate
-
-# full auto demo
-python run_demo.py --full
+# with higher security level
+python live_demo.py --768
+python live_demo.py --1024
 
 # check serial connection
-screen /dev/ttyACM0 9600
+ls /dev/ttyACM*
 
-# view stored data
-cat ~/iot_kyber_data/cloud_data.json | python -m json.tool
+# test arduino directly
+screen /dev/ttyACM0 9600
+# type PING and press Enter to test
+# press Ctrl+A then K to exit screen
 ```
 
 ---
@@ -573,6 +518,3 @@ cat ~/iot_kyber_data/cloud_data.json | python -m json.tool
 **Author**: Pustak Pathak  
 **Project**: Quantum-Safe Cryptography for IoT  
 **Date**: 2025
-
-
-
