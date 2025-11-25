@@ -1,0 +1,18 @@
+# quantum-safe iot demo - raspberry pi requirements
+# install with: pip install -r requirements.txt
+
+# kyber post-quantum crypto
+kyber-py>=0.3.0
+
+# aes encryption
+pycryptodome>=3.19.0
+
+# serial communication (arduino)
+pyserial>=3.5
+
+# optional: for data visualization
+# matplotlib>=3.7.0
+# pandas>=2.0.0
+
+
+
