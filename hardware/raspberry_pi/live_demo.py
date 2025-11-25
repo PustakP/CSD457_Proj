@@ -4,7 +4,16 @@ live_demo.py - ssh terminal demo with live updating display
 button press -> proxy re-encryption -> crystals-kyber encryption
 designed for headless rpi access via ssh
 
-usage: python live_demo.py
+optimized for 9600 baud serial:
+- aggressive serial buffering (reads all avail bytes immediately)
+- persistent display (completed results stay visible)
+- threaded serial reader prevents msg loss during processing
+- tracks recv vs processed msg ratio for debugging
+- auto-detects arduino port (/dev/ttyACM* or /dev/ttyUSB*)
+
+usage: python live_demo.py [--768|--1024] [--debug]
+  --768, --1024 : use kyber-768 or kyber-1024 (default: 512)
+  --debug       : enable verbose logging (shows raw serial msgs)
 """
 import serial
 import time
@@ -71,9 +80,11 @@ def move_cursor(row, col):
     print(f'\033[{row};{col}H', end='')
 
 
-def print_at(row, col, text):
+def print_at(row, col, text, clear_line=False):
     """print text at specific position"""
     move_cursor(row, col)
+    if clear_line:
+        print('\033[K', end='')  # clear from cursor to end of line
     print(text, end='', flush=True)
 
 
@@ -83,9 +94,18 @@ class LiveDemo:
     updates screen in real-time as button is pressed
     """
     
-    def __init__(self, security_level=512):
+    def __init__(self, security_level=512, debug=False):
         self.security_level = security_level
         self.kyber = Kyber512 if security_level == 512 else Kyber768 if security_level == 768 else Kyber1024
+        self.debug = debug  # enable verbose logging
+        
+        # debug log file (so we can see what's happening even with ui updates)
+        if debug:
+            self.debug_log = open('/tmp/live_demo_debug.log', 'w')
+            self.debug_log.write(f"=== live_demo debug log started ===\n")
+            self.debug_log.flush()
+        else:
+            self.debug_log = None
         
         # keys
         self.device_pk = None
@@ -109,10 +129,12 @@ class LiveDemo:
         self.last_data = None
         self.event_log = deque(maxlen=10)  # more events for demo
         self.dropped_messages = 0  # track msg loss
+        self.serial_lines_received = 0  # total lines from serial (for debugging)
         
         # display state
         self.status = "initializing"
         self.step = 0
+        self.last_metrics = None  # keep last result visible
         
         # content display - shows actual data at each step w/ full details for demo
         self.step_content = {
@@ -142,15 +164,56 @@ class LiveDemo:
         # connect serial
         self.connect_serial()
         
+    def auto_detect_arduino_port(self):
+        """auto-detect active arduino port by scanning /dev/ttyACM* and /dev/ttyUSB*"""
+        import glob
+        
+        # scan for all potential arduino ports
+        potential_ports = []
+        for pattern in ['/dev/ttyACM*', '/dev/ttyUSB*']:
+            potential_ports.extend(glob.glob(pattern))
+        
+        if not potential_ports:
+            return None
+        
+        # sort by modification time (most recent first) - active port usually changes more recently
+        potential_ports.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        
+        return potential_ports
+    
     def connect_serial(self):
-        """connect to arduino via serial"""
-        ports_to_try = [SERIAL_PORT, '/dev/ttyACM0', '/dev/ttyACM1', '/dev/ttyUSB0']
+        """connect to arduino via serial w/ auto-detection"""
+        # auto-detect arduino ports first
+        detected_ports = self.auto_detect_arduino_port()
+        if detected_ports:
+            self.log_event(f"detected arduino ports: {', '.join(detected_ports)}")
+            ports_to_try = detected_ports + [SERIAL_PORT]
+        else:
+            ports_to_try = [SERIAL_PORT, '/dev/ttyACM0', '/dev/ttyACM1', '/dev/ttyUSB0']
         
         for port in ports_to_try:
             try:
-                self.serial = serial.Serial(port, BAUD_RATE, timeout=0.1)
+                # longer timeout for 9600 baud, larger buffers to prevent msg loss
+                self.serial = serial.Serial(
+                    port, 
+                    BAUD_RATE, 
+                    timeout=1.0,  # longer timeout for reliable reads at 9600 baud
+                    write_timeout=1.0,
+                    inter_byte_timeout=0.1,
+                    exclusive=True  # fail if port already open (e.g. by screen)
+                )
+                # increase os buffer sizes if possible
+                try:
+                    self.serial.set_buffer_size(rx_size=4096, tx_size=4096)
+                except:
+                    pass
+                
                 time.sleep(2)  # wait for arduino reset
-                self.log_event(f"✓ connected to arduino on {port}")
+                self.log_event(f"✓ connected to arduino on {port} @ {BAUD_RATE} baud")
+                
+                # flush any stale data from buffer
+                self.serial.reset_input_buffer()
+                self.serial.reset_output_buffer()
                 
                 # send ping
                 self.serial.write(b"PING\n")
@@ -171,21 +234,62 @@ class LiveDemo:
         return False
     
     def _serial_reader(self):
-        """bg thread - continuously reads serial, queues msgs"""
+        """bg thread - continuously reads serial, queues msgs - aggressive for 9600 baud"""
+        buffer = ""
+        error_count = 0
         while self.running:
             try:
-                with self.serial_lock:
-                    if self.serial and self.serial.in_waiting:
-                        line = self.serial.readline().decode().strip()
-                        if line:
-                            try:
-                                self.msg_queue.put(line, block=False)  # non-blocking put
-                            except queue.Full:
-                                self.dropped_messages += 1
-                                # log but don't block
+                if self.serial:
+                    # check for data without lock first (faster)
+                    if self.serial.in_waiting > 0:
+                        with self.serial_lock:
+                            # read ALL available bytes immediately - prevents buffer overflow
+                            bytes_waiting = self.serial.in_waiting
+                            if bytes_waiting > 0:
+                                chunk = self.serial.read(bytes_waiting).decode('utf-8', errors='ignore')
+                                buffer += chunk
+                                
+                                # process all complete lines from buffer
+                                while '\n' in buffer or '\r' in buffer:
+                                    # handle both \n and \r\n line endings
+                                    if '\r\n' in buffer:
+                                        line, buffer = buffer.split('\r\n', 1)
+                                    elif '\n' in buffer:
+                                        line, buffer = buffer.split('\n', 1)
+                                    else:
+                                        line, buffer = buffer.split('\r', 1)
+                                    
+                                    line = line.strip()
+                                    if line:
+                                        self.serial_lines_received += 1  # count every line
+                                        # immediate debug logging
+                                        if self.debug:
+                                            msg = f"[SERIAL_RX #{self.serial_lines_received}] {line[:80]}\n"
+                                            if self.debug_log:
+                                                self.debug_log.write(msg)
+                                                self.debug_log.flush()
+                                        try:
+                                            self.msg_queue.put(line, block=False)
+                                            error_count = 0  # reset error count on success
+                                            if self.debug and self.debug_log:
+                                                self.debug_log.write(f"  → queued (qsize={self.msg_queue.qsize()})\n")
+                                                self.debug_log.flush()
+                                        except queue.Full:
+                                            self.dropped_messages += 1
+                                            if self.debug and self.debug_log:
+                                                self.debug_log.write(f"  ✗ QUEUE FULL (dropped)\n")
+                                                self.debug_log.flush()
+                        
+                        # if buffer is getting too large, truncate it (corrupted data)
+                        if len(buffer) > 512:
+                            buffer = buffer[-256:]  # keep last 256 chars
             except Exception as e:
-                pass
-            time.sleep(0.005)  # faster polling for rapid button presses
+                error_count += 1
+                if error_count < 5:  # only log first few errors
+                    pass  # silently ignore to not spam
+                time.sleep(0.01)  # back off on error
+            
+            time.sleep(0.0005)  # 0.5ms polling - very aggressive for 9600 baud
     
     def log_event(self, msg):
         """add event to log"""
@@ -195,10 +299,25 @@ class LiveDemo:
     def decrypt_device_msg(self, hex_data):
         """decrypt xor-encrypted data from arduino"""
         try:
+            if self.debug and self.debug_log:
+                self.debug_log.write(f"[DECRYPT] hex_data={hex_data[:60]}...\n")
+                self.debug_log.write(f"[DECRYPT] PSK={PSK.hex()}\n")
+                self.debug_log.flush()
             encrypted = bytes.fromhex(hex_data)
+            if self.debug and self.debug_log:
+                self.debug_log.write(f"[DECRYPT] encrypted len={len(encrypted)}\n")
+                self.debug_log.flush()
             decrypted = bytes(a ^ b for a, b in zip(encrypted, (PSK * ((len(encrypted) // len(PSK)) + 1))))
+            if self.debug and self.debug_log:
+                self.debug_log.write(f"[DECRYPT] decrypted={decrypted[:60]}\n")
+                self.debug_log.flush()
             return decrypted[:len(encrypted)]
-        except:
+        except Exception as e:
+            if self.debug and self.debug_log:
+                self.debug_log.write(f"[DECRYPT] ✗ ERROR: {type(e).__name__}: {e}\n")
+                self.debug_log.flush()
+            self.log_event(f"✗ decrypt error: {type(e).__name__}: {str(e)[:30]}")
+            self.draw_event_log()
             return None
     
     def truncate_hex(self, data, max_len=32):
@@ -220,6 +339,7 @@ class LiveDemo:
         
         # step 1: device encryption
         self.step = 1
+        self.status = "processing: device encrypt"
         plaintext_str = msg_bytes.decode()
         self.step_content[1] = {
             "label": "📱 IOT Device - Original Sensor Data",
@@ -228,8 +348,10 @@ class LiveDemo:
             "hex": self.truncate_hex(msg_bytes, 48),
             "desc": "unencrypted json from arduino"
         }
-        self.draw_step_indicator()
-        self.draw_step_content()
+        self.draw_step_indicator()  # just update step indicator
+        self.draw_step_content()     # just update content area
+        self.draw_status()  # update status bar
+        sys.stdout.flush()
         
         start = time.perf_counter()
         device_ss, device_ct = self.kyber.encaps(self.device_pk)
@@ -239,10 +361,11 @@ class LiveDemo:
         device_nonce = cipher.nonce
         metrics['device_enc_ms'] = (time.perf_counter() - start) * 1000
         
-        time.sleep(0.15)  # reduced visual pause for faster processing
+        time.sleep(0.2)  # shorter visual pause for responsiveness
         
         # step 2: gateway proxy re-encryption
         self.step = 2
+        self.status = "processing: gateway pre"
         combined_ct = device_ct + device_aes_ct
         self.step_content[2] = {
             "label": "🔐 Device Kyber Encrypted",
@@ -253,6 +376,8 @@ class LiveDemo:
         }
         self.draw_step_indicator()
         self.draw_step_content()
+        self.draw_status()  # update status bar
+        sys.stdout.flush()
         
         start = time.perf_counter()
         # gateway encaps for cloud
@@ -265,10 +390,11 @@ class LiveDemo:
         reenc_nonce = reenc_cipher.nonce
         metrics['gateway_reenc_ms'] = (time.perf_counter() - start) * 1000
         
-        time.sleep(0.15)
+        time.sleep(0.2)
         
         # step 3: cloud decryption
         self.step = 3
+        self.status = "processing: cloud decrypt"
         full_reenc = cloud_ct + reenc_ct
         self.step_content[3] = {
             "label": "🌐 Gateway PRE - Re-encrypted for Cloud",
@@ -279,6 +405,8 @@ class LiveDemo:
         }
         self.draw_step_indicator()
         self.draw_step_content()
+        self.draw_status()  # update status bar
+        sys.stdout.flush()
         
         start = time.perf_counter()
         # cloud decaps
@@ -300,14 +428,15 @@ class LiveDemo:
         final_plaintext = final_cipher.decrypt_and_verify(orig_ct, orig_tag)
         metrics['cloud_dec_ms'] = (time.perf_counter() - start) * 1000
         
-        time.sleep(0.25)
+        time.sleep(0.15)
         
         metrics['total_ms'] = metrics['device_enc_ms'] + metrics['gateway_reenc_ms'] + metrics['cloud_dec_ms']
         metrics['kyber_ct_size'] = len(device_ct)
         metrics['reenc_ct_size'] = len(cloud_ct) + len(reenc_ct)
         
-        # step 4: complete - show decrypted result
+        # step 4: complete - show decrypted result (this stays visible!)
         self.step = 4
+        self.status = "processing: verifying"
         decrypted_str = final_plaintext.decode()
         self.step_content[4] = {
             "label": "✅ Cloud Server - Decrypted & Verified",
@@ -318,7 +447,12 @@ class LiveDemo:
         }
         self.draw_step_indicator()
         self.draw_step_content()
+        self.draw_status()  # update status bar
+        sys.stdout.flush()
         
+        time.sleep(0.2)
+        
+        # result stays on screen until next message
         return final_plaintext, metrics
     
     def draw_header(self):
@@ -342,19 +476,19 @@ class LiveDemo:
         c = Colors
         row = 8
         
-        print_at(row, 1, f"{c.BOLD}{c.WHITE}━━━ DATA FLOW ━━━{c.RESET}")
+        print_at(row, 1, f"{c.BOLD}{c.WHITE}━━━ DATA FLOW ━━━{c.RESET}".ljust(72), clear_line=True)
         row += 1
         
         # workflow boxes
-        print_at(row, 1, f"┌────────────────┐     ┌────────────────┐     ┌────────────────┐")
+        print_at(row, 1, f"┌────────────────┐     ┌────────────────┐     ┌────────────────┐".ljust(72), clear_line=True)
         row += 1
-        print_at(row, 1, f"│{c.YELLOW}  ARDUINO/IOT   {c.RESET}│ ──▶ │{c.CYAN}  FOG GATEWAY   {c.RESET}│ ──▶ │{c.GREEN}  CLOUD SERVER  {c.RESET}│")
+        print_at(row, 1, f"│{c.YELLOW}  ARDUINO/IOT   {c.RESET}│ ──▶ │{c.CYAN}  FOG GATEWAY   {c.RESET}│ ──▶ │{c.GREEN}  CLOUD SERVER  {c.RESET}│".ljust(72), clear_line=True)
         row += 1
-        print_at(row, 1, f"│{c.DIM}  Button Press  {c.RESET}│     │{c.DIM}  Raspberry Pi  {c.RESET}│     │{c.DIM}  (Simulated)   {c.RESET}│")
+        print_at(row, 1, f"│{c.DIM}  Button Press  {c.RESET}│     │{c.DIM}  Raspberry Pi  {c.RESET}│     │{c.DIM}  (Simulated)   {c.RESET}│".ljust(72), clear_line=True)
         row += 1
-        print_at(row, 1, f"└────────────────┘     └────────────────┘     └────────────────┘")
+        print_at(row, 1, f"└────────────────┘     └────────────────┘     └────────────────┘".ljust(72), clear_line=True)
         row += 1
-        print_at(row, 1, f"{c.DIM}   XOR + PSK enc         Kyber encaps         Kyber decaps    {c.RESET}")
+        print_at(row, 1, f"{c.DIM}   XOR + PSK enc         Kyber encaps         Kyber decaps    {c.RESET}".ljust(72), clear_line=True)
         row += 2
         
     def draw_step_indicator(self):
@@ -369,7 +503,7 @@ class LiveDemo:
             ("4. Complete", "data secured!")
         ]
         
-        print_at(row, 1, f"{c.BOLD}{c.WHITE}━━━ PROCESSING STEPS ━━━{c.RESET}")
+        print_at(row, 1, f"{c.BOLD}{c.WHITE}━━━ PROCESSING STEPS ━━━{c.RESET}".ljust(72), clear_line=True)
         row += 1
         
         for i, (name, desc) in enumerate(steps):
@@ -386,7 +520,7 @@ class LiveDemo:
                 symbol = f"{c.DIM}○{c.RESET}"
                 color = c.DIM
             
-            print_at(row, 3, f"{symbol} {color}{name}{c.RESET} {c.DIM}- {desc}{c.RESET}          ")
+            print_at(row, 3, f"{symbol} {color}{name}{c.RESET} {c.DIM}- {desc}{c.RESET}".ljust(72), clear_line=True)
             row += 1
     
     def draw_step_content(self):
@@ -394,7 +528,7 @@ class LiveDemo:
         c = Colors
         row = 21
         
-        print_at(row, 1, f"{c.BOLD}{c.WHITE}━━━ DATA TRANSFORMATION (Live View) ━━━{c.RESET}")
+        print_at(row, 1, f"{c.BOLD}{c.WHITE}━━━ DATA TRANSFORMATION (Live View) ━━━{c.RESET}".ljust(72), clear_line=True)
         row += 1
         
         for i in range(1, 5):
@@ -424,34 +558,42 @@ class LiveDemo:
             
             # line 1: step label w/ size
             size_str = f"({size} bytes)" if size > 0 else ""
-            print_at(row, 3, f"{color}{indicator} {label} {size_str}{c.RESET}".ljust(72))
+            print_at(row, 1, f"  {color}{indicator} {label} {size_str}{c.RESET}".ljust(72), clear_line=True)
             row += 1
             
-            # line 2: show data content prominently for demo
+            # line 2+: show data content prominently for demo
             if data and i <= self.step:
                 if i == 1:
-                    # plaintext json - show full readable text
-                    display_data = data if len(data) <= 60 else data[:57] + "..."
-                    print_at(row, 5, f"{c.CYAN}Data: {display_data}{c.RESET}".ljust(72))
+                    # plaintext json - show full readable text (before encryption)
+                    display_data = data if len(data) <= 50 else data[:47] + "..."
+                    print_at(row, 1, f"    {c.CYAN}📄 Raw JSON: {display_data}{c.RESET}".ljust(72), clear_line=True)
+                    row += 1
+                    print_at(row, 1, f"    {c.DIM}(readable plaintext before encryption){c.RESET}".ljust(72), clear_line=True)
+                elif i == 2:
+                    # encrypted - show hex preview and explain what's encrypted
+                    print_at(row, 1, f"    {c.MAGENTA}🔒 Encrypted: {hex_preview}{c.RESET}".ljust(72), clear_line=True)
+                    row += 1
+                    print_at(row, 1, f"    {c.DIM}{desc} (sensor data now hidden){c.RESET}".ljust(72), clear_line=True)
+                elif i == 3:
+                    # re-encrypted - show hex preview
+                    print_at(row, 1, f"    {c.MAGENTA}🔐 Re-encrypted: {hex_preview}{c.RESET}".ljust(72), clear_line=True)
+                    row += 1
+                    print_at(row, 1, f"    {c.DIM}{desc} (gateway wrapped for cloud){c.RESET}".ljust(72), clear_line=True)
                 elif i == 4:
                     # final decrypted - show full readable text in green
-                    display_data = data if len(data) <= 60 else data[:57] + "..."
-                    print_at(row, 5, f"{c.GREEN}{hex_preview}{c.RESET}")
+                    display_data = data if len(data) <= 50 else data[:47] + "..."
+                    print_at(row, 1, f"    {c.GREEN}✅ {hex_preview}{c.RESET}".ljust(72), clear_line=True)
                     row += 1
-                    print_at(row, 5, f"{c.GREEN}Data: {display_data}{c.RESET}".ljust(72))
-                else:
-                    # encrypted - show hex + description
-                    print_at(row, 5, f"{c.MAGENTA}Hex: {hex_preview}{c.RESET}".ljust(72))
-                    if desc:
-                        row += 1
-                        print_at(row, 5, f"{c.DIM}     {desc}{c.RESET}".ljust(72))
+                    print_at(row, 1, f"    {c.GREEN}📄 Restored: {display_data}{c.RESET}".ljust(72), clear_line=True)
             else:
-                print_at(row, 5, " " * 70)
+                print_at(row, 1, " " * 72, clear_line=True)
+                row += 1
+                print_at(row, 1, " " * 72, clear_line=True)
             row += 1
             
             # spacing between steps
             if i < 4:
-                print_at(row, 3, f"{c.DIM}{'│':>1}{c.RESET}")
+                print_at(row, 1, f"  {c.DIM}│{c.RESET}".ljust(72), clear_line=True)
                 row += 1
         
         sys.stdout.flush()
@@ -459,141 +601,195 @@ class LiveDemo:
     def draw_metrics(self, metrics=None):
         """draw performance metrics"""
         c = Colors
-        row = 36
+        row = 40
         
-        print_at(row, 1, f"{c.BOLD}{c.WHITE}━━━ PERFORMANCE METRICS ━━━{c.RESET}")
+        print_at(row, 1, f"{c.BOLD}{c.WHITE}━━━ PERFORMANCE METRICS ━━━{c.RESET}".ljust(72), clear_line=True)
         row += 1
         
         if metrics:
-            print_at(row, 3, f"Device Encryption:    {c.CYAN}{metrics['device_enc_ms']:>8.2f} ms{c.RESET}")
+            print_at(row, 1, f"  Device Encryption:    {c.CYAN}{metrics['device_enc_ms']:>8.2f} ms{c.RESET}".ljust(72), clear_line=True)
             row += 1
-            print_at(row, 3, f"Gateway PRE:          {c.CYAN}{metrics['gateway_reenc_ms']:>8.2f} ms{c.RESET}")
+            print_at(row, 1, f"  Gateway PRE:          {c.CYAN}{metrics['gateway_reenc_ms']:>8.2f} ms{c.RESET}".ljust(72), clear_line=True)
             row += 1
-            print_at(row, 3, f"Cloud Decryption:     {c.CYAN}{metrics['cloud_dec_ms']:>8.2f} ms{c.RESET}")
+            print_at(row, 1, f"  Cloud Decryption:     {c.CYAN}{metrics['cloud_dec_ms']:>8.2f} ms{c.RESET}".ljust(72), clear_line=True)
             row += 1
-            print_at(row, 3, f"─────────────────────────────")
+            print_at(row, 1, f"  ─────────────────────────────".ljust(72), clear_line=True)
             row += 1
-            print_at(row, 3, f"Total Workflow:       {c.GREEN}{c.BOLD}{metrics['total_ms']:>8.2f} ms{c.RESET}")
+            print_at(row, 1, f"  Total Workflow:       {c.GREEN}{c.BOLD}{metrics['total_ms']:>8.2f} ms{c.RESET}".ljust(72), clear_line=True)
             row += 1
-            print_at(row, 3, f"Kyber CT Size:        {c.MAGENTA}{metrics['kyber_ct_size']:>8} bytes{c.RESET}")
+            print_at(row, 1, f"  Kyber CT Size:        {c.MAGENTA}{metrics['kyber_ct_size']:>8} bytes{c.RESET}".ljust(72), clear_line=True)
             row += 1
         else:
-            print_at(row, 3, f"{c.DIM}Waiting for button press...{c.RESET}              ")
+            print_at(row, 1, f"  {c.DIM}Waiting for button press...{c.RESET}".ljust(72), clear_line=True)
             for i in range(6):
                 row += 1
-                print_at(row, 3, "                                            ")
+                print_at(row, 1, " " * 72, clear_line=True)
     
     def draw_data(self, data=None):
         """draw sensor data"""
         c = Colors
-        row = 37
+        row = 48
         
-        print_at(row, 1, f"{c.BOLD}{c.WHITE}━━━ SENSOR DATA (Decrypted) ━━━{c.RESET}")
+        print_at(row, 1, f"{c.BOLD}{c.WHITE}━━━ SENSOR DATA (Decrypted) ━━━{c.RESET}".ljust(72), clear_line=True)
         row += 1
         
         if data:
-            print_at(row, 3, f"Device ID:    {c.YELLOW}{data.get('id', 'unknown')}{c.RESET}          ")
+            print_at(row, 1, f"  Device ID:    {c.YELLOW}{data.get('id', 'unknown')}{c.RESET}".ljust(72), clear_line=True)
             row += 1
-            print_at(row, 3, f"Temperature:  {c.RED}{data.get('t', '?'):>6.1f} °C{c.RESET}     ")
+            print_at(row, 1, f"  Temperature:  {c.RED}{data.get('t', '?'):>6.1f} °C{c.RESET}".ljust(72), clear_line=True)
             row += 1
-            print_at(row, 3, f"Humidity:     {c.BLUE}{data.get('h', '?'):>6.1f} %{c.RESET}      ")
+            print_at(row, 1, f"  Humidity:     {c.BLUE}{data.get('h', '?'):>6.1f} %{c.RESET}".ljust(72), clear_line=True)
             row += 1
-            print_at(row, 3, f"Light:        {c.YELLOW}{data.get('l', '?'):>6} lux{c.RESET}    ")
+            print_at(row, 1, f"  Light:        {c.YELLOW}{data.get('l', '?'):>6} lux{c.RESET}".ljust(72), clear_line=True)
             row += 1
-            print_at(row, 3, f"Sequence:     {c.DIM}#{data.get('seq', 0)}{c.RESET}              ")
+            print_at(row, 1, f"  Sequence:     {c.DIM}#{data.get('seq', 0)}{c.RESET}".ljust(72), clear_line=True)
         else:
             for i in range(5):
-                print_at(row, 3, "                                            ")
+                print_at(row, 1, " " * 72, clear_line=True)
                 row += 1
     
     def draw_event_log(self):
         """draw event log"""
         c = Colors
-        row = 45
+        row = 53
         
-        print_at(row, 1, f"{c.BOLD}{c.WHITE}━━━ EVENT LOG ━━━{c.RESET}")
+        print_at(row, 1, f"{c.BOLD}{c.WHITE}━━━ EVENT LOG ━━━{c.RESET}".ljust(72), clear_line=True)
         row += 1
         
         # show last 7 events for better demo visibility
-        for i, event in enumerate(list(self.event_log)[-7:]):
-            print_at(row, 3, f"{c.DIM}{event}{c.RESET}".ljust(72))
+        recent_events = list(self.event_log)[-7:]
+        for i, event in enumerate(recent_events):
+            # truncate event if too long
+            event_text = event if len(event) <= 68 else event[:65] + "..."
+            print_at(row, 1, f"  {c.DIM}{event_text}{c.RESET}".ljust(72), clear_line=True)
             row += 1
         
         # clear extra lines
-        for _ in range(7 - len(list(self.event_log)[-7:])):
-            print_at(row, 3, " " * 72)
+        for _ in range(7 - len(recent_events)):
+            print_at(row, 1, " " * 72, clear_line=True)
             row += 1
     
     def draw_status(self):
         """draw status bar"""
         c = Colors
-        row = 52
+        row = 62
         
-        status_color = c.GREEN if self.status == "ready" else c.YELLOW if self.status == "processing" else c.CYAN
+        # determine status color
+        if "ready" in self.status.lower():
+            status_color = c.GREEN
+        elif "processing" in self.status.lower():
+            status_color = c.YELLOW
+        else:
+            status_color = c.CYAN
         
-        print_at(row, 1, f"{'─' * 72}")
+        print_at(row, 1, f"{'─' * 72}".ljust(72), clear_line=True)
         row += 1
         
-        # show dropped msg warning if any
+        # show queue status and dropped msg warning
+        queue_size = self.msg_queue.qsize()
+        queue_str = f"{c.YELLOW}Queue: {queue_size}{c.RESET}" if queue_size > 5 else f"{c.DIM}Queue: {queue_size}{c.RESET}"
+        
         dropped_str = ""
         if self.dropped_messages > 0:
-            dropped_str = f"  {c.RED}│ Dropped: {self.dropped_messages}{c.RESET}"
+            dropped_str = f" {c.RED}│ Drop: {self.dropped_messages}{c.RESET}"
         
-        print_at(row, 1, f"{c.BOLD}Status:{c.RESET} {status_color}{self.status.upper()}{c.RESET}  │  "
-                        f"Messages: {c.CYAN}{self.total_messages}{c.RESET}  │  "
-                        f"Avg Time: {c.GREEN}{self.total_enc_time / max(1, self.total_messages):.2f}ms{c.RESET}"
-                        f"{dropped_str}  │  {c.DIM}Ctrl+C=exit{c.RESET}")
+        # show serial recv vs processed ratio for debugging
+        recv_str = f"{c.DIM}│ Recv: {self.serial_lines_received}{c.RESET}" if self.serial else ""
+        
+        # truncate status if too long
+        status_text = self.status[:20] if len(self.status) <= 20 else self.status[:17] + "..."
+        
+        status_line = (f"{c.BOLD}Status:{c.RESET} {status_color}{status_text.upper()}{c.RESET}  │  "
+                      f"Proc: {c.CYAN}{self.total_messages}{c.RESET} {recv_str}  │  "
+                      f"{queue_str}{dropped_str}  │  "
+                      f"Avg: {c.GREEN}{self.total_enc_time / max(1, self.total_messages):.1f}ms{c.RESET}  │  "
+                      f"{c.DIM}Ctrl+C{c.RESET}")
+        
+        print_at(row, 1, status_line[:72].ljust(72), clear_line=True)
     
     def draw_full(self, metrics=None, data=None):
-        """draw full screen"""
+        """draw full screen - complete redraw"""
         self.draw_header()
         self.draw_workflow()
         self.draw_step_indicator()
+        self.draw_step_content()  # show transformation steps
         self.draw_metrics(metrics)
-        self.draw_data(data)
         self.draw_event_log()
         self.draw_status()
         sys.stdout.flush()
     
     def process_message(self, hex_data):
-        """process incoming encrypted message"""
-        self.status = "processing"
-        self.step = 0
-        self.draw_status()
-        
-        # decrypt xor layer from arduino
-        decrypted = self.decrypt_device_msg(hex_data)
-        if not decrypted:
-            self.log_event("✗ failed to decrypt device data")
-            return
-        
+        """process incoming encrypted message - keeps last result visible"""
         try:
-            data = json.loads(decrypted.decode())
-        except:
-            self.log_event("✗ invalid json from device")
-            return
+            self.status = "processing: decrypting"
+            self.step = 0
+            self.draw_status()  # only update status line, keep rest visible
+            sys.stdout.flush()
+            
+            # decrypt xor layer from arduino
+            self.log_event(f"decrypting {len(hex_data)} hex chars...")
+            self.draw_event_log()
+            decrypted = self.decrypt_device_msg(hex_data)
+            if not decrypted:
+                self.log_event("✗ failed to decrypt device data (check PSK)")
+                self.draw_event_log()
+                self.status = "ready"
+                self.draw_status()
+                sys.stdout.flush()
+                return
+            
+            # log decrypted preview for debugging
+            try:
+                preview = decrypted.decode('utf-8', errors='replace')[:50]
+                self.log_event(f"decrypted: {preview}...")
+                self.draw_event_log()
+            except Exception:
+                pass  # ignore preview errors
+            
+            try:
+                data = json.loads(decrypted.decode())
+            except Exception as e:
+                self.log_event(f"✗ invalid json: {type(e).__name__}")
+                self.log_event(f"  raw: {decrypted[:60]}")
+                self.draw_event_log()
+                self.status = "ready"
+                self.draw_status()
+                sys.stdout.flush()
+                return
         
-        self.log_event(f"→ button pressed! device_id={data.get('id', 'unknown')}")
-        self.log_event(f"  sensors: {data.get('t')}°C, {data.get('h')}%, {data.get('l')}lux")
+            self.log_event(f"→ button pressed! device_id={data.get('id', 'unknown')}")
+            self.log_event(f"  sensors: {data.get('t')}°C, {data.get('h')}%, {data.get('l')}lux")
+            self.draw_event_log()  # show receipt immediately
+            sys.stdout.flush()
+            
+            # do full pre + kyber workflow - updates display as it goes
+            final_plaintext, metrics = self.do_proxy_reencryption(data)
         
-        # do full pre + kyber workflow
-        final_plaintext, metrics = self.do_proxy_reencryption(data)
-        
-        # verify
-        final_data = json.loads(final_plaintext.decode())
-        if final_data == data:
-            self.log_event(f"✓ proxy re-encryption successful! ({metrics['total_ms']:.1f}ms)")
-        else:
-            self.log_event("✗ data integrity check failed!")
-        
-        # update stats
-        self.total_messages += 1
-        self.total_enc_time += metrics['total_ms']
-        self.last_data = data
-        
-        # update display
-        self.status = "ready"
-        self.draw_full(metrics, data)
+            # verify
+            final_data = json.loads(final_plaintext.decode())
+            if final_data == data:
+                self.log_event(f"✓ proxy re-encryption successful! ({metrics['total_ms']:.1f}ms)")
+            else:
+                self.log_event("✗ data integrity check failed!")
+            
+            # update stats
+            self.total_messages += 1
+            self.total_enc_time += metrics['total_ms']
+            self.last_data = data
+            self.last_metrics = metrics  # save for persistent display
+            
+            # final update - result stays visible (step_content already updated)
+            self.status = "ready"
+            self.draw_metrics(metrics)
+            self.draw_event_log()
+            self.draw_status()
+            sys.stdout.flush()
+        except Exception as e:
+            self.log_event(f"✗ processing error: {e}")
+            self.draw_event_log()
+            self.status = "ready"
+            self.draw_status()
+            sys.stdout.flush()
     
     def simulate_button_press(self):
         """simulate a button press for testing"""
@@ -624,8 +820,8 @@ class LiveDemo:
         self.status = "ready"
         self.running = True
         
-        # initial draw
-        self.draw_full()
+        # initial draw - show waiting state
+        self.draw_full(self.last_metrics, self.last_data)
         self.log_event("system ready - press button on arduino")
         self.draw_event_log()
         self.draw_status()
@@ -636,21 +832,73 @@ class LiveDemo:
         try:
             while self.running:
                 # process all queued msgs from threaded reader - prevents msg loss
+                msgs_processed = 0
+                queue_size = self.msg_queue.qsize()
+                if self.debug and queue_size > 0 and self.debug_log:
+                    self.debug_log.write(f"\n[MAIN_LOOP] queue_size={queue_size}, starting to process...\n")
+                    self.debug_log.flush()
+                
                 while not self.msg_queue.empty():
                     try:
                         line = self.msg_queue.get_nowait()
+                        msgs_processed += 1
                         
+                        # debug: log raw line
+                        if self.debug and self.debug_log:
+                            self.debug_log.write(f"[PROCESSING #{msgs_processed}] line={repr(line[:80])}\n")
+                            self.debug_log.flush()
+                            self.log_event(f"[raw] {repr(line[:60])}")
+                            self.draw_event_log()
+                        
+                        # log every received line for debugging
                         if line.startswith('ENC:'):
-                            hex_data = line[4:]
-                            self.process_message(hex_data)
+                            if self.debug and self.debug_log:
+                                self.debug_log.write(f"  → matched ENC: pattern\n")
+                                self.debug_log.flush()
+                            hex_data = line[4:].strip()  # strip whitespace
+                            if len(hex_data) > 0:
+                                if self.debug and self.debug_log:
+                                    self.debug_log.write(f"  → hex_data len={len(hex_data)}, calling process_message...\n")
+                                    self.debug_log.flush()
+                                self.log_event(f"⚡ enc msg rcvd ({len(hex_data)} hex chars)")
+                                self.draw_event_log()
+                                self.draw_status()
+                                self.process_message(hex_data)
+                            else:
+                                if self.debug and self.debug_log:
+                                    self.debug_log.write(f"  ✗ empty hex_data\n")
+                                    self.debug_log.flush()
+                                self.log_event(f"✗ empty enc data")
+                                self.draw_event_log()
+                                self.draw_status()
+                        elif line.startswith('# BUTTON') or line.startswith('BUTTON'):
+                            # handle both "# BUTTON" and "BUTTON" formats
+                            btn_msg = line[2:].strip() if line.startswith('#') else line.strip()
+                            self.log_event(f"🔘 {btn_msg}")
+                            self.draw_event_log()
+                            self.draw_status()
                         elif line.startswith('#'):
-                            self.log_event(f"arduino: {line[2:]}")
+                            # filter out debug messages (too noisy for display)
+                            if not line.startswith('# DEBUG:'):
+                                self.log_event(f"arduino: {line[2:].strip()}")
+                                self.draw_event_log()
+                                self.draw_status()
+                        elif line.startswith('PONG'):
+                            # handle both "PONG:" and "PONG" formats
+                            pong_msg = line[5:] if line.startswith('PONG:') else line[4:]
+                            self.log_event(f"✓ arduino online: {pong_msg}")
                             self.draw_event_log()
                             self.draw_status()
-                        elif line.startswith('PONG:'):
-                            self.log_event(f"arduino online: {line[5:]}")
+                        elif line.startswith('STATUS:'):
+                            self.log_event(f"status: {line[7:]}")
                             self.draw_event_log()
                             self.draw_status()
+                        else:
+                            # log ALL unknown messages for debugging
+                            if line.strip():
+                                self.log_event(f"??? unknown [{len(line)}]: {line[:45]}")
+                                self.draw_event_log()
+                                self.draw_status()
                     except queue.Empty:
                         break
                 
@@ -673,12 +921,19 @@ class LiveDemo:
             if self.serial:
                 self.serial.close()
             
+            # close debug log
+            if self.debug_log:
+                self.debug_log.write(f"\n=== demo ended, total_messages={self.total_messages} ===\n")
+                self.debug_log.close()
+            
             # cleanup
             print()
-            move_cursor(55, 1)
+            move_cursor(65, 1)
             print(f"\n{Colors.CYAN}Demo ended. Total messages: {self.total_messages}{Colors.RESET}")
             if self.total_messages > 0:
                 print(f"Average processing time: {self.total_enc_time / self.total_messages:.2f}ms")
+            if self.debug:
+                print(f"{Colors.YELLOW}Debug log saved to: /tmp/live_demo_debug.log{Colors.RESET}")
             print()
 
 
@@ -695,12 +950,16 @@ def main():
     
     # check args
     security_level = 512
+    debug = False
     if '--768' in sys.argv:
         security_level = 768
     elif '--1024' in sys.argv:
         security_level = 1024
+    if '--debug' in sys.argv:
+        debug = True
+        print("  [DEBUG MODE ENABLED - verbose logging]\n")
     
-    demo = LiveDemo(security_level=security_level)
+    demo = LiveDemo(security_level=security_level, debug=debug)
     
     input("Press Enter to start demo...")
     
