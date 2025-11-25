@@ -12,6 +12,7 @@ import json
 import sys
 import os
 import threading
+import queue
 from datetime import datetime
 from collections import deque
 
@@ -94,20 +95,38 @@ class LiveDemo:
         self.cloud_pk = None
         self.cloud_sk = None
         
-        # serial
+        # serial w/ threaded reader - prevents msg loss during processing
         self.serial = None
-        self.running = False
+        self.serial_lock = threading.Lock()
+        self.running = True  # set true before serial thread starts to prevent msg loss
+        self.msg_queue = queue.Queue(maxsize=100)  # larger queue for burst msgs
+        self.serial_thread = None
         
         # stats
         self.total_messages = 0
         self.total_enc_time = 0
         self.total_dec_time = 0
         self.last_data = None
-        self.event_log = deque(maxlen=8)
+        self.event_log = deque(maxlen=10)  # more events for demo
+        self.dropped_messages = 0  # track msg loss
         
         # display state
         self.status = "initializing"
         self.step = 0
+        
+        # content display - shows actual data at each step w/ full details for demo
+        self.step_content = {
+            1: {"label": "Plaintext JSON", "data": "", "size": 0, "hex": "", "desc": ""},
+            2: {"label": "Kyber Ciphertext", "data": "", "size": 0, "hex": "", "desc": ""},
+            3: {"label": "Re-encrypted CT", "data": "", "size": 0, "hex": "", "desc": ""},
+            4: {"label": "Decrypted Result", "data": "", "size": 0, "hex": "", "desc": ""}
+        }
+        
+        # raw plaintext for display
+        self.current_plaintext = ""
+        
+        # display width for hex preview
+        self.hex_preview_width = 64
         
     def setup(self):
         """init all crypto keys and serial"""
@@ -129,7 +148,7 @@ class LiveDemo:
         
         for port in ports_to_try:
             try:
-                self.serial = serial.Serial(port, BAUD_RATE, timeout=0.5)
+                self.serial = serial.Serial(port, BAUD_RATE, timeout=0.1)
                 time.sleep(2)  # wait for arduino reset
                 self.log_event(f"✓ connected to arduino on {port}")
                 
@@ -139,12 +158,34 @@ class LiveDemo:
                 if self.serial.in_waiting:
                     resp = self.serial.readline().decode().strip()
                     self.log_event(f"  arduino: {resp}")
+                
+                # start threaded reader - prevents msg loss during processing
+                self.serial_thread = threading.Thread(target=self._serial_reader, daemon=True)
+                self.serial_thread.start()
+                self.log_event("✓ serial reader thread started")
                 return True
             except Exception as e:
                 continue
         
         self.log_event("✗ arduino not found - using simulation mode")
         return False
+    
+    def _serial_reader(self):
+        """bg thread - continuously reads serial, queues msgs"""
+        while self.running:
+            try:
+                with self.serial_lock:
+                    if self.serial and self.serial.in_waiting:
+                        line = self.serial.readline().decode().strip()
+                        if line:
+                            try:
+                                self.msg_queue.put(line, block=False)  # non-blocking put
+                            except queue.Full:
+                                self.dropped_messages += 1
+                                # log but don't block
+            except Exception as e:
+                pass
+            time.sleep(0.005)  # faster polling for rapid button presses
     
     def log_event(self, msg):
         """add event to log"""
@@ -160,6 +201,13 @@ class LiveDemo:
         except:
             return None
     
+    def truncate_hex(self, data, max_len=32):
+        """truncate hex str for display w/ ellipsis"""
+        hex_str = data.hex().upper() if isinstance(data, bytes) else str(data).upper()
+        if len(hex_str) > max_len:
+            return hex_str[:max_len] + "..."
+        return hex_str
+    
     def do_proxy_reencryption(self, plaintext_data):
         """
         full pre + kyber workflow:
@@ -168,25 +216,43 @@ class LiveDemo:
         3. cloud decrypts
         """
         metrics = {}
+        msg_bytes = json.dumps(plaintext_data).encode() if isinstance(plaintext_data, dict) else plaintext_data.encode()
         
         # step 1: device encryption
         self.step = 1
+        plaintext_str = msg_bytes.decode()
+        self.step_content[1] = {
+            "label": "📱 IOT Device - Original Sensor Data",
+            "data": plaintext_str,
+            "size": len(msg_bytes),
+            "hex": self.truncate_hex(msg_bytes, 48),
+            "desc": "unencrypted json from arduino"
+        }
         self.draw_step_indicator()
+        self.draw_step_content()
         
         start = time.perf_counter()
         device_ss, device_ct = self.kyber.encaps(self.device_pk)
         aes_key = device_ss[:32]
         cipher = AES.new(aes_key, AES.MODE_GCM)
-        msg_bytes = json.dumps(plaintext_data).encode() if isinstance(plaintext_data, dict) else plaintext_data.encode()
         device_aes_ct, device_tag = cipher.encrypt_and_digest(msg_bytes)
         device_nonce = cipher.nonce
         metrics['device_enc_ms'] = (time.perf_counter() - start) * 1000
         
-        time.sleep(0.3)  # visual pause
+        time.sleep(0.15)  # reduced visual pause for faster processing
         
         # step 2: gateway proxy re-encryption
         self.step = 2
+        combined_ct = device_ct + device_aes_ct
+        self.step_content[2] = {
+            "label": "🔐 Device Kyber Encrypted",
+            "data": f"Kyber-{self.security_level} KEM ciphertext + AES-GCM payload",
+            "size": len(combined_ct),
+            "hex": self.truncate_hex(combined_ct[:24], 48),
+            "desc": f"kem_ct({len(device_ct)}B) + aes_ct({len(device_aes_ct)}B)"
+        }
         self.draw_step_indicator()
+        self.draw_step_content()
         
         start = time.perf_counter()
         # gateway encaps for cloud
@@ -199,11 +265,20 @@ class LiveDemo:
         reenc_nonce = reenc_cipher.nonce
         metrics['gateway_reenc_ms'] = (time.perf_counter() - start) * 1000
         
-        time.sleep(0.3)
+        time.sleep(0.15)
         
         # step 3: cloud decryption
         self.step = 3
+        full_reenc = cloud_ct + reenc_ct
+        self.step_content[3] = {
+            "label": "🌐 Gateway PRE - Re-encrypted for Cloud",
+            "data": f"Proxy re-encrypted with cloud's public key",
+            "size": len(full_reenc),
+            "hex": self.truncate_hex(full_reenc[:24], 48),
+            "desc": f"cloud_kem({len(cloud_ct)}B) + wrapped({len(reenc_ct)}B)"
+        }
         self.draw_step_indicator()
+        self.draw_step_content()
         
         start = time.perf_counter()
         # cloud decaps
@@ -225,13 +300,24 @@ class LiveDemo:
         final_plaintext = final_cipher.decrypt_and_verify(orig_ct, orig_tag)
         metrics['cloud_dec_ms'] = (time.perf_counter() - start) * 1000
         
+        time.sleep(0.25)
+        
         metrics['total_ms'] = metrics['device_enc_ms'] + metrics['gateway_reenc_ms'] + metrics['cloud_dec_ms']
         metrics['kyber_ct_size'] = len(device_ct)
         metrics['reenc_ct_size'] = len(cloud_ct) + len(reenc_ct)
         
-        # step 4: complete
+        # step 4: complete - show decrypted result
         self.step = 4
+        decrypted_str = final_plaintext.decode()
+        self.step_content[4] = {
+            "label": "✅ Cloud Server - Decrypted & Verified",
+            "data": decrypted_str,
+            "size": len(final_plaintext),
+            "hex": "✓ INTEGRITY VERIFIED",
+            "desc": "data matches original plaintext"
+        }
         self.draw_step_indicator()
+        self.draw_step_content()
         
         return final_plaintext, metrics
     
@@ -302,11 +388,78 @@ class LiveDemo:
             
             print_at(row, 3, f"{symbol} {color}{name}{c.RESET} {c.DIM}- {desc}{c.RESET}          ")
             row += 1
+    
+    def draw_step_content(self):
+        """draw content being processed at each step - verbose for demo"""
+        c = Colors
+        row = 21
+        
+        print_at(row, 1, f"{c.BOLD}{c.WHITE}━━━ DATA TRANSFORMATION (Live View) ━━━{c.RESET}")
+        row += 1
+        
+        for i in range(1, 5):
+            content = self.step_content.get(i, {})
+            label = content.get("label", f"Step {i}")
+            data = content.get("data", "")
+            size = content.get("size", 0)
+            hex_preview = content.get("hex", "")
+            desc = content.get("desc", "")
+            
+            if i < self.step:
+                # completed step - dim
+                color = c.DIM
+                indicator = "✓"
+            elif i == self.step:
+                # current step - highlighted
+                color = c.YELLOW + c.BOLD
+                indicator = "▶"
+            else:
+                # pending - very dim
+                color = c.DIM
+                indicator = "○"
+                data = "waiting..."
+                hex_preview = ""
+                size = 0
+                desc = ""
+            
+            # line 1: step label w/ size
+            size_str = f"({size} bytes)" if size > 0 else ""
+            print_at(row, 3, f"{color}{indicator} {label} {size_str}{c.RESET}".ljust(72))
+            row += 1
+            
+            # line 2: show data content prominently for demo
+            if data and i <= self.step:
+                if i == 1:
+                    # plaintext json - show full readable text
+                    display_data = data if len(data) <= 60 else data[:57] + "..."
+                    print_at(row, 5, f"{c.CYAN}Data: {display_data}{c.RESET}".ljust(72))
+                elif i == 4:
+                    # final decrypted - show full readable text in green
+                    display_data = data if len(data) <= 60 else data[:57] + "..."
+                    print_at(row, 5, f"{c.GREEN}{hex_preview}{c.RESET}")
+                    row += 1
+                    print_at(row, 5, f"{c.GREEN}Data: {display_data}{c.RESET}".ljust(72))
+                else:
+                    # encrypted - show hex + description
+                    print_at(row, 5, f"{c.MAGENTA}Hex: {hex_preview}{c.RESET}".ljust(72))
+                    if desc:
+                        row += 1
+                        print_at(row, 5, f"{c.DIM}     {desc}{c.RESET}".ljust(72))
+            else:
+                print_at(row, 5, " " * 70)
+            row += 1
+            
+            # spacing between steps
+            if i < 4:
+                print_at(row, 3, f"{c.DIM}{'│':>1}{c.RESET}")
+                row += 1
+        
+        sys.stdout.flush()
         
     def draw_metrics(self, metrics=None):
         """draw performance metrics"""
         c = Colors
-        row = 22
+        row = 36
         
         print_at(row, 1, f"{c.BOLD}{c.WHITE}━━━ PERFORMANCE METRICS ━━━{c.RESET}")
         row += 1
@@ -333,7 +486,7 @@ class LiveDemo:
     def draw_data(self, data=None):
         """draw sensor data"""
         c = Colors
-        row = 31
+        row = 37
         
         print_at(row, 1, f"{c.BOLD}{c.WHITE}━━━ SENSOR DATA (Decrypted) ━━━{c.RESET}")
         row += 1
@@ -356,28 +509,40 @@ class LiveDemo:
     def draw_event_log(self):
         """draw event log"""
         c = Colors
-        row = 38
+        row = 45
         
         print_at(row, 1, f"{c.BOLD}{c.WHITE}━━━ EVENT LOG ━━━{c.RESET}")
         row += 1
         
-        for i, event in enumerate(list(self.event_log)[-6:]):
-            print_at(row, 3, f"{c.DIM}{event}{c.RESET}".ljust(70))
+        # show last 7 events for better demo visibility
+        for i, event in enumerate(list(self.event_log)[-7:]):
+            print_at(row, 3, f"{c.DIM}{event}{c.RESET}".ljust(72))
+            row += 1
+        
+        # clear extra lines
+        for _ in range(7 - len(list(self.event_log)[-7:])):
+            print_at(row, 3, " " * 72)
             row += 1
     
     def draw_status(self):
         """draw status bar"""
         c = Colors
-        row = 45
+        row = 52
         
         status_color = c.GREEN if self.status == "ready" else c.YELLOW if self.status == "processing" else c.CYAN
         
         print_at(row, 1, f"{'─' * 72}")
         row += 1
+        
+        # show dropped msg warning if any
+        dropped_str = ""
+        if self.dropped_messages > 0:
+            dropped_str = f"  {c.RED}│ Dropped: {self.dropped_messages}{c.RESET}"
+        
         print_at(row, 1, f"{c.BOLD}Status:{c.RESET} {status_color}{self.status.upper()}{c.RESET}  │  "
                         f"Messages: {c.CYAN}{self.total_messages}{c.RESET}  │  "
-                        f"Avg Time: {c.GREEN}{self.total_enc_time / max(1, self.total_messages):.2f}ms{c.RESET}  │  "
-                        f"{c.DIM}Press Ctrl+C to exit{c.RESET}")
+                        f"Avg Time: {c.GREEN}{self.total_enc_time / max(1, self.total_messages):.2f}ms{c.RESET}"
+                        f"{dropped_str}  │  {c.DIM}Ctrl+C=exit{c.RESET}")
     
     def draw_full(self, metrics=None, data=None):
         """draw full screen"""
@@ -408,7 +573,8 @@ class LiveDemo:
             self.log_event("✗ invalid json from device")
             return
         
-        self.log_event(f"→ received: temp={data.get('t')}°C, humid={data.get('h')}%")
+        self.log_event(f"→ button pressed! device_id={data.get('id', 'unknown')}")
+        self.log_event(f"  sensors: {data.get('t')}°C, {data.get('h')}%, {data.get('l')}lux")
         
         # do full pre + kyber workflow
         final_plaintext, metrics = self.do_proxy_reencryption(data)
@@ -469,25 +635,27 @@ class LiveDemo:
         
         try:
             while self.running:
-                # check serial for arduino data
-                if self.serial and self.serial.in_waiting:
-                    line = self.serial.readline().decode().strip()
-                    
-                    if line.startswith('ENC:'):
-                        hex_data = line[4:]
-                        self.process_message(hex_data)
-                    elif line.startswith('#'):
-                        self.log_event(f"arduino: {line[2:]}")
-                        self.draw_event_log()
-                        self.draw_status()
-                    elif line.startswith('PONG:'):
-                        self.log_event(f"arduino online: {line[5:]}")
-                        self.draw_event_log()
-                        self.draw_status()
+                # process all queued msgs from threaded reader - prevents msg loss
+                while not self.msg_queue.empty():
+                    try:
+                        line = self.msg_queue.get_nowait()
+                        
+                        if line.startswith('ENC:'):
+                            hex_data = line[4:]
+                            self.process_message(hex_data)
+                        elif line.startswith('#'):
+                            self.log_event(f"arduino: {line[2:]}")
+                            self.draw_event_log()
+                            self.draw_status()
+                        elif line.startswith('PONG:'):
+                            self.log_event(f"arduino online: {line[5:]}")
+                            self.draw_event_log()
+                            self.draw_status()
+                    except queue.Empty:
+                        break
                 
-                # simulation mode - press 's' to simulate
+                # simulation mode - auto-trigger for testing
                 if sim_mode:
-                    # check for simulated trigger (every 10s or manual)
                     now = time.time()
                     if now - last_sim > 30:
                         last_sim = now
@@ -496,7 +664,7 @@ class LiveDemo:
                         hex_data = self.simulate_button_press()
                         self.process_message(hex_data)
                 
-                time.sleep(0.1)
+                time.sleep(0.02)  # very fast polling for button responsiveness
                 
         except KeyboardInterrupt:
             pass
@@ -507,7 +675,7 @@ class LiveDemo:
             
             # cleanup
             print()
-            move_cursor(48, 1)
+            move_cursor(55, 1)
             print(f"\n{Colors.CYAN}Demo ended. Total messages: {self.total_messages}{Colors.RESET}")
             if self.total_messages > 0:
                 print(f"Average processing time: {self.total_enc_time / self.total_messages:.2f}ms")
